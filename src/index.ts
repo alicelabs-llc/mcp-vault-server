@@ -1,156 +1,159 @@
-// ── Entry Point v4 (Fortaleza) ────────────────────────────────────────────────
-import express, { type Request, type Response } from "express";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import crypto from "crypto";
+// ── MCP Vault Entrypoint v5 (Titanium) ──────────────────────────────────────
+// Transporte HTTP/SSE para comunicación blindada con el SDK MCP.
+
+import express from "express";
+import { createServer } from "http";
+import cors from "cors";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import {
+    SERVER_NAME,
+    SERVER_VERSION,
+    DEFAULT_PORT,
+    MAX_JSON_BODY_SIZE,
+    SHUTDOWN_TIMEOUT_MS,
+    REQUEST_ID_REGEX
+} from "./constants.js";
 import { loadConfig } from "./config.js";
-import { createMcpServer, requestContext, createServices } from "./server.js";
+import { createServices, createMcpServer, requestContext } from "./server.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { rateLimitMiddleware } from "./middleware/rateLimiter.js";
-import { SERVER_VERSION } from "./constants.js";
-
-// FIX M-9: Capturar errores no manejados antes de que maten el proceso sin log
-process.on("unhandledRejection", (reason) => {
-    process.stderr.write(`🔴 UnhandledRejection: ${String(reason)}\n`);
-    process.exit(1);
-});
-process.on("uncaughtException", (err) => {
-    process.stderr.write(`🔴 UncaughtException: ${String(err)}\n`);
-    process.exit(1);
-});
+import { randomUUID } from "crypto";
+import type { IncomingMessage, ServerResponse } from "http";
 
 const config = loadConfig();
-const services = createServices(config);
+const app = express();
+const httpServer = createServer(app);
 
-let stdioServer: McpServer | null = null;
+// ── Inyección de Servicios ────────────────────────────────────────────────────
+const { audit, svc, pubsub } = createServices(config);
+const mcpServer = createMcpServer({ audit, svc, pubsub });
 
-if (config.transport === "stdio") {
-    stdioServer = createMcpServer(services);
-    const transport = new StdioServerTransport();
-    try {
-        await stdioServer.connect(transport);
-    } catch (e) {
-        process.stderr.write(`❌ Error iniciando transporte stdio: ${e}\n`);
-        process.exit(1);
+// ── Blindaje de Protocolo (Security Headers) ──────────────────────────────────
+app.disable("x-powered-by");
+
+app.use((req, res, next) => {
+    let requestId = req.headers["x-request-id"];
+    if (typeof requestId !== "string" || !REQUEST_ID_REGEX.test(requestId)) {
+        requestId = randomUUID();
     }
-} else {
-    const app = express();
+    res.setHeader("X-Request-Id", requestId);
+    (req as any).requestId = requestId;
 
-    // FIX Bug-4: Solo confiar en el primer proxy (Cloud Run load balancer)
-    app.set("trust proxy", 1);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("X-XSS-Protection", "1; mode=block");
+    res.setHeader("Strict-Transport-Security", "max-age=63072000; includeSubDomains; preload");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("Permissions-Policy", "accelerometer=(), camera=(), geolocation=(), microphone=(), payment=(), usb=()");
+    res.setHeader("Server", `${SERVER_NAME}/${SERVER_VERSION}`);
 
-    // ── CORS ────────────────────────────────────────────────────────────────
-    app.use((req: Request, res: Response, next) => {
-        const origin = req.headers["origin"] ?? "";
-        const allowed = config.allowedOrigins.length > 0
-            ? config.allowedOrigins
-            : ["http://localhost:3000", "http://localhost:8080"];
+    next();
+});
 
-        if (allowed.includes(origin) || (allowed.includes("*") && process.env.NODE_ENV !== "production")) {
-            res.setHeader("Access-Control-Allow-Origin", origin);
-            res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+// ── Sistema de CORS ────────────────────────────────────────────────────────────
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || config.allowedOrigins.includes(origin)) {
+            callback(null, true);
+        } else {
+            audit.log({ action: "security_breach", secretId: null, clientId: "sys", success: false, reason: `CORS_VIOLATION: ${origin}` });
+            callback(new Error("Violation of same-origin or allowed-origins policy"));
         }
-        if (req.method === "OPTIONS") { res.sendStatus(204); return; }
-        next();
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Request-Id"],
+    maxAge: 86400,
+}));
+
+app.use(express.json({ limit: MAX_JSON_BODY_SIZE }));
+
+// ── Puntos de Control Anónimos ────────────────────────────────────────────────
+app.get("/health", (req, res) => {
+    const stats = svc.circuitBreakerStats;
+    res.status(stats.state !== "OPEN" ? 200 : 503).json({
+        status: stats.state !== "OPEN" ? "OK" : "DEGRADED",
+        version: SERVER_VERSION,
+        timestamp: new Date().toISOString()
     });
+});
 
-    // ── Security Headers ────────────────────────────────────────────────────
-    app.use((req: Request, res: Response, next) => {
-        // FIX A-1: Sanitizar X-Request-Id — nunca reflejar valor crudo del cliente
-        const rawId = req.headers["x-request-id"];
-        const requestId = typeof rawId === "string" && /^[a-zA-Z0-9_\-]{1,64}$/.test(rawId)
-            ? rawId
-            : crypto.randomUUID();
+// ── Transporte MCP (SSE) ──────────────────────────────────────────────────────
+let transport: SSEServerTransport | null = null;
 
-        res.setHeader("X-Request-Id", requestId);
-        res.setHeader("X-Content-Type-Options", "nosniff");
-        res.setHeader("X-Frame-Options", "DENY");
-        res.setHeader("X-XSS-Protection", "0");
-        res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-        res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
-        res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
-        res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-        res.setHeader("Pragma", "no-cache");
-        res.setHeader("Expires", "0");
-        next();
-    });
+app.get("/sse",
+    rateLimitMiddleware(audit),
+    authMiddleware(config),
+    async (req, res) => {
+        const clientId = (req as any).clientId;
 
-    app.use(express.json({ limit: "1mb" }));
+        transport = new SSEServerTransport("/messages", res as unknown as ServerResponse);
+        await mcpServer.connect(transport);
 
-    // ── Health / Readiness ──────────────────────────────────────────────────
-    app.get("/health", (_req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
-    app.get("/ready", (_req, res) => res.json({ ready: true }));
+        audit.log({ action: "notify_rotation", secretId: null, clientId, success: true, reason: "SSE_CONNECTION_ESTABLISHED" });
+        process.stderr.write(`🔌 SSE: Connected ${clientId} [${(req as any).requestId}]\n`);
+    }
+);
 
-    // ── Security Jitter ────────────────────────────────────────────────────
-    const securityJitter = () => new Promise(r => setTimeout(r, 50 + Math.random() * 200));
+app.post("/messages",
+    rateLimitMiddleware(audit),
+    authMiddleware(config),
+    async (req, res) => {
+        if (!transport) {
+            res.status(400).json({ error: "Missing active SSE connection" });
+            return;
+        }
 
-    // ── MCP Endpoint (protegido) ────────────────────────────────────────────
-    app.post("/mcp",
-        rateLimitMiddleware,
-        authMiddleware(config),
-        async (req: Request, res: Response) => {
-            const clientId = (req as Request & { clientId: string }).clientId;
-            const sessionServer = createMcpServer(services);
-            const transport = new StreamableHTTPServerTransport({
-                sessionIdGenerator: () => crypto.randomUUID(),
-                enableJsonResponse: true,
-            });
+        const clientId = (req as any).clientId;
 
-            res.on("close", async () => {
-                await transport.close();
-                await sessionServer.close();
-            });
-
-            try {
-                await requestContext.run({ clientId }, async () => {
-                    await sessionServer.connect(transport);
-                    await transport.handleRequest(req, res, req.body);
-                });
-            } catch (e) {
-                await securityJitter();
-                if (!res.headersSent) {
-                    res.status(500).json({
-                        error: "Internal Security Error",
-                        ticketId: crypto.randomBytes(4).toString("hex"),
-                    });
-                }
-            }
-        },
-    );
-
-    // ── 404 catch-all ───────────────────────────────────────────────────────
-    app.use((_req: Request, res: Response) => {
-        res.status(404).json({ error: "Not Found" });
-    });
-
-    // ── Start ───────────────────────────────────────────────────────────────
-    const httpServer = app.listen(config.port, () => {
-        process.stderr.write(`✅ GCP Secrets MCP Server v${SERVER_VERSION} — puerto ${config.port}\n`);
-    });
-
-    // ── Graceful Shutdown ───────────────────────────────────────────────────
-    const shutdown = (signal: string) => {
-        process.stderr.write(`⚠️  ${signal} recibido — iniciando apagado limpio...\n`);
-        httpServer.close(async () => {
-            process.stderr.write("📡 Conexiones HTTP cerradas.\n");
-            if (stdioServer) {
-                await stdioServer.close();
-                process.stderr.write("🔌 MCP Server (stdio) cerrado.\n");
-            }
-            // FIX A-6: destruir servicios limpiamente
-            services.svc.destroy();
-            process.stderr.write("🔌 Shutdown completado.\n");
-            process.exit(0);
+        await requestContext.run({ clientId }, async () => {
+            // Cast a any para asegurar compatibilidad con los tipos extendidos de Express
+            await transport!.handlePostMessage(req as unknown as IncomingMessage, res as unknown as ServerResponse);
         });
-        setTimeout(() => {
-            process.stderr.write("⛔ Timeout de apagado — forzando salida.\n");
-            process.exit(1);
-        }, 8_000).unref();
-    };
+    }
+);
 
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("SIGINT",  () => shutdown("SIGINT"));
+// ── Manejo Global de Errores ──────────────────────────────────────────────────
+app.use((req, res) => {
+    res.status(404).json({ error: "Operation not found" });
+});
+
+app.use((err: any, req: any, res: any, next: any) => {
+    const reqId = req.requestId;
+    audit.logError("security_breach", null, req.clientId || "sys", "GLOBAL_SYSTEM_ERROR", err.stack || err.message);
+
+    if (res.headersSent) return next(err);
+
+    res.status(err.status || 500).json({
+        error: "Internal Security Error",
+        message: "A security or protocol violation occurred.",
+        requestId: reqId
+    });
+});
+
+// ── Inicio y Shutdown ─────────────────────────────────────────────────────────
+const PORT = process.env.PORT || config.port || DEFAULT_PORT;
+httpServer.listen(PORT, () => {
+    process.stderr.write(`🚀 ${SERVER_NAME} v${SERVER_VERSION} online at port ${PORT}\n`);
+});
+
+function gracefulShutdown(signal: string) {
+    process.stderr.write(`\n🛑 Signal [${signal}]: Shutting down services\n`);
+    httpServer.close(() => {
+        svc.destroy();
+        process.exit(0);
+    });
+
+    setTimeout(() => {
+        process.stderr.write("⚠️ Force shutdown timeout exceeded\n");
+        process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
 }
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("unhandledRejection", (reason: any) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    audit.logError("security_breach", null, "sys", "UNHANDLED_REJECTION", msg);
+    process.stderr.write(`🚨 UNHANDLED_REJECTION: ${msg}\n`);
+});

@@ -1,38 +1,75 @@
-// ── CacheService v4 (Fortaleza) ───────────────────────────────────────────────
-import { createCipheriv, createDecipheriv, randomBytes, createHmac, timingSafeEqual } from "crypto";
-import { CACHE_TTL_MS, CACHE_MAX_ENTRIES } from "../constants.js";
+// ── CacheService v5 (Titanium) ────────────────────────────────────────────────
+// Cifrado Authenticated Encryption with Associated Data (AEAD) en memoria.
+// Implementa scrubbing de memoria y rotación determinística de llaves.
+
+import {
+    createCipheriv,
+    createDecipheriv,
+    randomBytes,
+    createHmac,
+    timingSafeEqual
+} from "crypto";
+import {
+    CACHE_TTL_MS,
+    CACHE_MAX_ENTRIES,
+    CACHE_KEY_ROTATION_MS
+} from "../constants.js";
 import type { CacheEntry } from "../types.js";
 import { AuditService } from "./AuditService.js";
 
 const ALGO = "aes-256-gcm";
-let RUNTIME_KEY = randomBytes(32);
-let HMAC_KEY = randomBytes(32);
+const IV_LENGTH = 12; // NIST standard para GCM
+const TAG_LENGTH = 16;
+const KEY_LENGTH = 32;
 
+let RUNTIME_KEY = randomBytes(KEY_LENGTH);
+let HMAC_KEY = randomBytes(KEY_LENGTH);
+
+/**
+ * Encapsulación de cifrado con autenticación doble (Encrypt-then-MAC).
+ * GCM ya es AEAD, pero el HMAC adicional protege contra debilidades
+ * específicas de implementación de GCM en ciertos entornos y asegura
+ * la integridad del IV y el Tag antes de tocar la primitiva de cifrado.
+ */
 function encryptValue(plain: string): { iv: Buffer; tag: Buffer; data: Buffer; mac: Buffer } {
-    const iv = randomBytes(16);
-    const cipher = createCipheriv(ALGO, RUNTIME_KEY, iv);
-    const data = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+    const iv = randomBytes(IV_LENGTH);
+    const cipher = createCipheriv(ALGO, RUNTIME_KEY, iv, { authTagLength: TAG_LENGTH });
+
+    const data = Buffer.concat([
+        cipher.update(plain, "utf8"),
+        cipher.final()
+    ]);
     const tag = cipher.getAuthTag();
-    const mac = createHmac("sha256", HMAC_KEY).update(Buffer.concat([iv, data, tag])).digest();
+
+    // HMAC-SHA256 sobre [IV + DATA + TAG]
+    const mac = createHmac("sha256", HMAC_KEY)
+        .update(Buffer.concat([iv, data, tag]))
+        .digest();
+
     return { iv, tag, data, mac };
 }
 
 function decryptValue(enc: { iv: Buffer; tag: Buffer; data: Buffer }): Buffer {
-    const decipher = createDecipheriv(ALGO, RUNTIME_KEY, enc.iv);
+    const decipher = createDecipheriv(ALGO, RUNTIME_KEY, enc.iv, { authTagLength: TAG_LENGTH });
     decipher.setAuthTag(enc.tag);
-    return Buffer.concat([decipher.update(enc.data), decipher.final()]);
+
+    return Buffer.concat([
+        decipher.update(enc.data),
+        decipher.final()
+    ]);
 }
 
 function verifyMac(entry: { iv: Buffer; tag: Buffer; data: Buffer; mac: Buffer }): boolean {
     const computed = createHmac("sha256", HMAC_KEY)
         .update(Buffer.concat([entry.iv, entry.data, entry.tag]))
         .digest();
+    // Timing-safe comparison para evitar ataques de oráculo de padding/mac
     return timingSafeEqual(computed, entry.mac);
 }
 
 export class CacheService {
-    // FIX A-6: WeakRef para evitar memory leak — el GC puede liberar instancias destruidas
     private static instances = new Set<CacheService>();
+    private static _rotationStarted = false;
 
     private stringStore = new Map<string, CacheEntry<{ iv: Buffer; tag: Buffer; data: Buffer; mac: Buffer }>>();
     private objectStore = new Map<string, CacheEntry<{ iv: Buffer; tag: Buffer; data: Buffer; mac: Buffer }>>();
@@ -43,23 +80,29 @@ export class CacheService {
         CacheService._ensureRotationStarted();
     }
 
-    private static _rotationStarted = false;
+    /**
+     * Rotación global de claves. Al rotar, todo el caché previo se vuelve ilegible
+     * y debe ser purgado. Esto limita la ventana de exposición de una llave filtrada.
+     */
     private static _ensureRotationStarted(): void {
         if (this._rotationStarted) return;
         this._rotationStarted = true;
 
         setInterval(() => {
-            RUNTIME_KEY = randomBytes(32);
-            HMAC_KEY = randomBytes(32);
-            // FIX: limpiar todas las instancias al rotar — entradas viejas son indescifrable
+            // Scrubbing de llaves viejas antes de reemplazarlas
+            RUNTIME_KEY.fill(0);
+            HMAC_KEY.fill(0);
+
+            RUNTIME_KEY = randomBytes(KEY_LENGTH);
+            HMAC_KEY = randomBytes(KEY_LENGTH);
+
             for (const instance of CacheService.instances) {
                 instance.clear();
             }
-            process.stderr.write("🔐 Keys rotated + cache cleared\n");
-        }, 4 * 60 * 60 * 1000).unref();
+            process.stderr.write("🔐 Rotation: Keys updated and caches flushed\n");
+        }, CACHE_KEY_ROTATION_MS).unref();
     }
 
-    // FIX A-6: destroy() para remover del Set estático — evita memory leak
     public destroy(): void {
         this.clear();
         CacheService.instances.delete(this);
@@ -71,60 +114,86 @@ export class CacheService {
         this.objectStore.clear();
     }
 
-    setString(key: string, value: string, ttlMs = CACHE_TTL_MS): void {
+    public setString(key: string, value: string, ttlMs = CACHE_TTL_MS): void {
         if (this.destroyed) return;
         this._evictIfNeeded(this.stringStore);
+
         const enc = encryptValue(value);
-        this.stringStore.set(key, { value: enc, expiresAt: Date.now() + ttlMs, iv: enc.iv, tag: enc.tag });
+        this.stringStore.set(key, {
+            value: enc,
+            expiresAt: Date.now() + ttlMs,
+            createdAt: Date.now()
+        });
     }
 
-    getString(key: string): string | null {
+    public getString(key: string): string | null {
         if (this.destroyed) return null;
         const entry = this.stringStore.get(key);
+
         if (!entry) return null;
-        if (Date.now() > entry.expiresAt) { this.stringStore.delete(key); return null; }
+        if (Date.now() > entry.expiresAt) {
+            this.stringStore.delete(key);
+            return null;
+        }
 
-        this.stringStore.delete(key);
-        this.stringStore.set(key, entry);
-
-        // FIX C-1/Bug-1: HMAC check completo antes de descifrar
+        // Integrity Check
         if (!verifyMac(entry.value)) {
-            this.audit?.log({ action: "security_breach", secretId: key, clientId: "system", success: false, reason: "CACHE_TAMPERING_DETECTED_STRING" });
-            throw new Error("Cache integrity violation detected");
+            this.audit?.log({
+                action: "security_breach",
+                secretId: key,
+                clientId: "cache-system",
+                success: false,
+                reason: "CACHE_TAMPERING_DETECTED_STRING"
+            });
+            throw new Error("Security Integrity Violation: Cache compromised");
         }
 
         const dec = decryptValue(entry.value);
         const result = dec.toString("utf8");
+
+        // Memset/Scrubbing del buffer de texto plano de la memoria de Node
         dec.fill(0);
+
         return result;
     }
 
-    // FIX C-2: permite preguntar cuándo expira la metadata para forzar re-check de labels
-    getStringAge(key: string): number | null {
+    public getStringAge(key: string): number | null {
         const entry = this.stringStore.get(key);
         if (!entry) return null;
         return entry.expiresAt - Date.now();
     }
 
-    setObject<T>(key: string, value: T, ttlMs = CACHE_TTL_MS): void {
+    public setObject<T>(key: string, value: T, ttlMs = CACHE_TTL_MS): void {
         if (this.destroyed) return;
         this._evictIfNeeded(this.objectStore);
+
         const enc = encryptValue(JSON.stringify(value));
-        this.objectStore.set(key, { value: enc, expiresAt: Date.now() + ttlMs, iv: enc.iv, tag: enc.tag });
+        this.objectStore.set(key, {
+            value: enc,
+            expiresAt: Date.now() + ttlMs,
+            createdAt: Date.now()
+        });
     }
 
-    getObject<T>(key: string): T | null {
+    public getObject<T>(key: string): T | null {
         if (this.destroyed) return null;
         const entry = this.objectStore.get(key);
-        if (!entry) return null;
-        if (Date.now() > entry.expiresAt) { this.objectStore.delete(key); return null; }
 
-        this.objectStore.delete(key);
-        this.objectStore.set(key, entry);
+        if (!entry) return null;
+        if (Date.now() > entry.expiresAt) {
+            this.objectStore.delete(key);
+            return null;
+        }
 
         if (!verifyMac(entry.value)) {
-            this.audit?.log({ action: "security_breach", secretId: key, clientId: "system", success: false, reason: "CACHE_TAMPERING_DETECTED_OBJECT" });
-            throw new Error("Security violation: cache integrity check failed");
+            this.audit?.log({
+                action: "security_breach",
+                secretId: key,
+                clientId: "cache-system",
+                success: false,
+                reason: "CACHE_TAMPERING_DETECTED_OBJECT"
+            });
+            throw new Error("Security Integrity Violation: Cache compromised");
         }
 
         const dec = decryptValue(entry.value);
@@ -133,17 +202,26 @@ export class CacheService {
         return result;
     }
 
-    invalidatePrefix(prefix: string): void {
+    public invalidatePrefix(prefix: string): void {
         for (const k of this.stringStore.keys()) if (k.startsWith(prefix)) this.stringStore.delete(k);
         for (const k of this.objectStore.keys()) if (k.startsWith(prefix)) this.objectStore.delete(k);
     }
 
-    delete(key: string): void { this.stringStore.delete(key); this.objectStore.delete(key); }
+    public delete(key: string): void {
+        this.stringStore.delete(key);
+        this.objectStore.delete(key);
+    }
 
-    get stats() { return { strings: this.stringStore.size, objects: this.objectStore.size }; }
+    public get stats() {
+        return {
+            strings: this.stringStore.size,
+            objects: this.objectStore.size
+        };
+    }
 
     private _evictIfNeeded(store: Map<string, unknown>): void {
         if (store.size >= CACHE_MAX_ENTRIES) {
+            // Estrategia FIFO para desalojo
             const toRemove = Math.ceil(CACHE_MAX_ENTRIES * 0.1);
             const keys = store.keys();
             for (let i = 0; i < toRemove; i++) {

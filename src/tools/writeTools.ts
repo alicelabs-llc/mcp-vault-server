@@ -1,14 +1,17 @@
-// ── Tools de escritura v3 (Remediado) ─────────────────────────────────────────
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+// ── Tools de Escritura v5 (Titanium) ───────────────────────────────────────────
+// Interfaz RCP para mutación controlada de secretos en GCP.
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { SecretManagerService } from "../services/SecretManagerService.js";
 import { CreateSecretSchema, AddVersionSchema, DisableVersionSchema } from "../schemas/secrets.js";
 
 const ok = (data: unknown) => ({
     content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
 });
+
 const err = (msg: string) => ({
     isError: true as const,
-    content: [{ type: "text" as const, text: msg }],
+    content: [{ type: "text" as const, text: `MUTATION_DENIED: ${msg}` }],
 });
 
 export function registerWriteTools(
@@ -17,41 +20,27 @@ export function registerWriteTools(
     clientId: () => string,
 ): void {
 
-    // ── vault_create_secret ─────────────────────────────────────────────────
     server.registerTool("vault_create_secret", {
-        title: "Crear secreto",
-        description: `Crea un nuevo secreto en Secret Manager con el label mcp-accessible=true.
-Se puede agregar labels adicionales para organización.`,
+        description: "Crea un secreto con label de boveda mcp-accessible=true para auditoría.",
         inputSchema: CreateSecretSchema,
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     }, async (p) => {
-        try { return ok(await svc.createSecret(p.secretId, p.labels, clientId())); }
-        catch (e) { return err(e instanceof Error ? e.message : String(e)); }
+        try { return ok(await svc.createSecret(p.secretId, p.labels ?? {}, clientId())); }
+        catch (e) { return err(e instanceof Error ? e.message : "Creation Refused"); }
     });
 
-    // ── vault_add_version ───────────────────────────────────────────────────
     server.registerTool("vault_add_version", {
-        title: "Rotar secreto (nueva versión)",
-        description: `Agrega una nueva versión al secreto. La anterior permanece habilitada.
-Notifica por Pub/Sub a suscriptores para recarga de configuración.
-
-⚠️ El 'value' contiene el secreto real. Trátalo como información sensible.`,
+        description: "Rotar secreto (nueva versión). Notifica vía Pub/Sub a receptores.\n⚠️ Alta Sensibilidad.",
         inputSchema: AddVersionSchema,
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     }, async (p) => {
         try { return ok({ secretId: p.secretId, newVersion: await svc.addSecretVersion(p.secretId, p.value, clientId()) }); }
-        catch (e) { return err(e instanceof Error ? e.message : String(e)); }
+        catch (e) { return err(e instanceof Error ? e.message : "Rotation Denied"); }
     });
 
-    // ── vault_disable_version ───────────────────────────────────────────────
     server.registerTool("vault_disable_version", {
-        title: "Desactivar versión",
-        description: `Desactiva una versión específica del secreto. La versión no se elimina,
-pero ya no puede ser accedida. Útil para invalidar versiones comprometidas.`,
+        description: "Invalida una versión específica del contenedor. Acción destructiva en acceso.",
         inputSchema: DisableVersionSchema,
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     }, async (p) => {
         try { return ok(await svc.disableVersion(p.secretId, p.version, clientId())); }
-        catch (e) { return err(e instanceof Error ? e.message : String(e)); }
+        catch (e) { return err(e instanceof Error ? e.message : "Invalidation Failed"); }
     });
 }

@@ -1,6 +1,6 @@
 {
   "name": "gcp-secrets-mcp-server",
-  "version": "3.0.0",
+  "version": "5.0.0",
   "description": "MCP Server de producción (Nivel Fortaleza) para Google Cloud Secret Manager.",
   "type": "module",
   "main": "dist/index.js",
@@ -16,10 +16,12 @@
     "@google-cloud/pubsub": "^5.3.0",
     "@google-cloud/secret-manager": "^6.1.1",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "cors": "^2.8.6",
     "express": "^5.2.1",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.5",
     "tsx": "^4.19.2",

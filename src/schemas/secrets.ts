@@ -1,4 +1,4 @@
-// ── Schemas v4 (Fortaleza) ────────────────────────────────────────────────────
+// ── Schemas v5 (Titanium) ────────────────────────────────────────────────────
 import { z } from "zod";
 import { MAX_PAGE_SIZE, DEFAULT_PAGE_SIZE } from "../constants.js";
 
@@ -23,8 +23,7 @@ const ReasonSchema = z
 const TicketIdSchema = z.string().optional()
     .describe("ID de ticket/tarea opcional, ej: JIRA-456");
 
-// FIX M-5: Labels con validación estricta según límites reales de GCP
-// GCP: max 64 labels, keys ≤ 63 chars (lowercase), values ≤ 63 chars
+// Labels con validación estricta según límites reales de GCP
 const GcpLabelKeySchema = z.string()
     .min(1).max(63)
     .regex(/^[a-z][a-z0-9_-]*$/, "Label key: solo minúsculas, números, _ y - (empieza con letra)");
@@ -34,7 +33,7 @@ const GcpLabelValueSchema = z.string()
     .regex(/^[a-z0-9_-]*$/, "Label value: solo minúsculas, números, _ y -");
 
 const LabelsSchema = z.record(GcpLabelKeySchema, GcpLabelValueSchema)
-    .max(64, "Máximo 64 labels permitidos por GCP")
+    .refine(r => Object.keys(r).length <= 64, "Máximo 64 labels permitidos por GCP")
     .optional()
     .default({});
 
@@ -61,7 +60,7 @@ export const CreateSecretSchema = z.object({
 
 export const AddVersionSchema = z.object({
     secretId: SecretIdSchema,
-    value: z.string().min(1),
+    value: z.string().min(1).max(65536, "Secret weight exceeds security threshold (64KB)"),
 }).strict();
 
 export const DisableVersionSchema = z.object({
